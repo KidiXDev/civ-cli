@@ -21,6 +21,8 @@ var (
 )
 
 func Execute() {
+	cobra.MousetrapHelpText = ""
+
 	rootCmd := &cobra.Command{
 		Use:   "civitool",
 		Short: "Civitool - The Ultimate Civitai CLI",
