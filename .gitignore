@@ -37,3 +37,6 @@ go.work.sum
 *.yaml
 *.md
 *.txt
+
+# Distribution
+dist/

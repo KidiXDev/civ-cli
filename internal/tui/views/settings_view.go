@@ -88,9 +88,11 @@ func (m *SettingsView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *SettingsView) saveSetting(key, val string) {
 	cfg := m.router.GetConfig()
+	val = strings.ReplaceAll(val, "\x00", "")
+
 	switch key {
 	case "API Key":
-		cfg.APIKey = val
+		cfg.APIKey = strings.TrimSpace(val)
 	case "Default Search Limit":
 		if v, err := strconv.Atoi(val); err == nil {
 			cfg.DefaultSearchLimit = v

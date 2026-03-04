@@ -102,20 +102,19 @@ func (m *FilterView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.adjustOption(-1)
 		case "right", "l":
 			m.adjustOption(1)
-		case "enter", " ":
+		case " ":
 			if m.cursor == 4 {
-				// Toggle NSFW
 				m.state.Options.NSFW = !m.state.Options.NSFW
-			} else {
-				// Apply filters
-				m.applyFilters()
-				m.router.Pop()
-				var applyCmd tea.Cmd
-				if m.state.OnApply != nil {
-					applyCmd = m.state.OnApply(m.state.Options)
-				}
-				return m, applyCmd
 			}
+		case "enter":
+			// Apply filters
+			m.applyFilters()
+			m.router.Pop()
+			var applyCmd tea.Cmd
+			if m.state.OnApply != nil {
+				applyCmd = m.state.OnApply(m.state.Options)
+			}
+			return m, applyCmd
 		}
 	}
 	return m, nil
@@ -133,7 +132,8 @@ func (m *FilterView) adjustOption(dir int) {
 		// Rating (not currently bounded strictly, but we can cycle 0-5)
 		m.state.Options.Rating = m.cycle(m.state.Options.Rating, dir, 6)
 	case 4:
-		// NSFW is a boolean, handled by Enter
+		// Toggle NSFW on left/right
+		m.state.Options.NSFW = !m.state.Options.NSFW
 	}
 }
 
@@ -204,7 +204,7 @@ func (m *FilterView) View() string {
 	b.WriteString(m.renderOption(4, "NSFW", nsfwVal))
 
 	b.WriteString("\n")
-	b.WriteString(ui.Sub("[Up/Down] Navigate  [Left/Right] Change Value  [Enter] Apply (Toggle NSFW)  [Esc] Back"))
+	b.WriteString(ui.Sub("[Up/Down] Navigate  [Left/Right] Change Value  [Space] Toggle NSFW  [Enter] Apply  [Esc] Back"))
 
 	return fmt.Sprintf("\n  %s\n", strings.ReplaceAll(b.String(), "\n", "\n  "))
 }

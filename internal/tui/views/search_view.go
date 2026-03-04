@@ -103,7 +103,6 @@ func (m *SearchView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.router.Push(NewFilterView(m.router, m.options, func(opts civitai.SearchModelsOptions) tea.Cmd {
 					m.options = opts
 					m.page = opts.Page
-					m.query = opts.Query // Sync query
 					m.state = StateLoading
 					return m.searchCmd()
 				}))
@@ -159,9 +158,7 @@ func (m *SearchView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *SearchView) searchCmd() tea.Cmd {
 	return func() tea.Msg {
 		opts := m.options
-		if opts.Query == "" && m.query != "" {
-			opts.Query = m.query
-		}
+		opts.Query = m.query
 		opts.Limit = m.router.GetConfig().DefaultSearchLimit
 		opts.Page = m.page
 

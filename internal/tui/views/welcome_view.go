@@ -32,7 +32,8 @@ func (m *WelcomeView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.router.Quit()
 			return m, tea.Quit
 		case tea.KeyEnter:
-			apiKey := strings.TrimSpace(m.input)
+			cleanInput := strings.ReplaceAll(m.input, "\x00", "")
+			apiKey := strings.TrimSpace(cleanInput)
 			if apiKey == "" {
 				m.err = "API Key cannot be empty."
 				return m, nil

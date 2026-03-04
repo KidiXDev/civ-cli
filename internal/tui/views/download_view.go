@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/KidiXDev/civ-cli/internal/civitai"
+	"github.com/KidiXDev/civ-cli/internal/downloader"
 	"github.com/KidiXDev/civ-cli/pkg/ui"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -87,8 +89,9 @@ func (m *ConfirmView) View() string {
 type DownloadViewState int
 
 const (
-	DLStateConfirm DownloadViewState = iota
-	DLStateDownloading
+	DLStateConfirm     DownloadViewState = iota
+	DLStateDownloading                   // actively downloading
+	DLStateCancelling                    // user requested cancel, waiting for cleanup
 	DLStateSuccess
 	DLStateError
 )
@@ -100,32 +103,26 @@ type DownloadView struct {
 	state   DownloadViewState
 	err     string
 
-	bytesDld   int64
-	totalBytes int64
+	progress   downloader.Progress        // latest progress snapshot
+	result     *downloader.DownloadResult // populated on success
 	outputFile string
+	totalBytes int64
 
-	progressChan chan int
+	progressChan chan downloader.Progress
+	doneChan     chan dlCompleteMsg
+	cancel       context.CancelFunc
 }
 
-type progressMsg struct {
-	bytes int
+// --- Bubbletea messages ---
+
+type downloadProgressMsg struct {
+	progress downloader.Progress
 }
 
 type dlCompleteMsg struct {
-	path string
-	err  error
+	result *downloader.DownloadResult
+	err    error
 }
-
-// customWriter bridges io.Writer to tea.Msg
-type customWriter struct {
-	ch chan int
-}
-
-func (cw *customWriter) Write(p []byte) (n int, err error) {
-	cw.ch <- len(p)
-	return len(p), nil
-}
-func (cw *customWriter) ChangeMax64(max int64) {} // ignore, we have it in totalBytes
 
 func NewDownloadView(router AppRouter, model civitai.Model, version civitai.ModelVersion) *DownloadView {
 	var totalBytes int64
@@ -146,7 +143,8 @@ func NewDownloadView(router AppRouter, model civitai.Model, version civitai.Mode
 		version:      version,
 		state:        DLStateConfirm,
 		totalBytes:   totalBytes,
-		progressChan: make(chan int, 100),
+		progressChan: make(chan downloader.Progress, 50),
+		doneChan:     make(chan dlCompleteMsg, 1),
 	}
 }
 
@@ -154,10 +152,15 @@ func (m *DownloadView) Init() tea.Cmd {
 	return nil
 }
 
-func waitForProgress(ch chan int) tea.Cmd {
+// waitForDownloadEvent blocks until a progress update or completion arrives.
+func waitForDownloadEvent(progressCh chan downloader.Progress, doneCh chan dlCompleteMsg) tea.Cmd {
 	return func() tea.Msg {
-		bytes := <-ch
-		return progressMsg{bytes}
+		select {
+		case p := <-progressCh:
+			return downloadProgressMsg{progress: p}
+		case d := <-doneCh:
+			return d
+		}
 	}
 }
 
@@ -166,34 +169,43 @@ func (m *DownloadView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "esc", "q":
-			if m.state != DLStateDownloading {
+			switch m.state {
+			case DLStateDownloading:
+				m.state = DLStateCancelling
+				if m.cancel != nil {
+					m.cancel()
+				}
+				// keep listening for the completion message
+			case DLStateCancelling:
+				// already cancelling – ignore
+			default:
 				m.router.Pop()
 			}
 		case "enter", "y":
 			if m.state == DLStateConfirm {
 				m.state = DLStateDownloading
-
-				return m, tea.Batch(
-					m.startDownloadCmd(),
-					waitForProgress(m.progressChan),
-				)
+				return m, m.startDownloadCmd()
 			}
 		}
 
-	case progressMsg:
-		m.bytesDld += int64(msg.bytes)
-		if m.state == DLStateDownloading {
-			return m, waitForProgress(m.progressChan)
+	case downloadProgressMsg:
+		m.progress = msg.progress
+		if m.state == DLStateDownloading || m.state == DLStateCancelling {
+			return m, waitForDownloadEvent(m.progressChan, m.doneChan)
 		}
 
 	case dlCompleteMsg:
 		if msg.err != nil {
-			m.err = msg.err.Error()
+			if m.state == DLStateCancelling {
+				m.err = "Download cancelled by user"
+			} else {
+				m.err = msg.err.Error()
+			}
 			m.state = DLStateError
 		} else {
-			m.outputFile = msg.path
-			// artificially max out
-			m.bytesDld = m.totalBytes
+			m.result = msg.result
+			m.outputFile = msg.result.FilePath
+			m.progress.DownloadedBytes = m.totalBytes // ensure bar shows 100%
 			m.state = DLStateSuccess
 		}
 		return m, nil
@@ -202,15 +214,34 @@ func (m *DownloadView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *DownloadView) startDownloadCmd() tea.Cmd {
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel = cancel
+
 	return func() tea.Msg {
-		cw := &customWriter{ch: m.progressChan}
-		path, err := m.router.GetDownloader().DownloadToWriter(
-			context.Background(),
-			m.version.ID,
-			m.router.GetConfig().DefaultDownloadDir,
-			cw,
-		)
-		return dlCompleteMsg{path: path, err: err}
+		go func() {
+			result, err := m.router.GetDownloader().Download(
+				ctx,
+				m.version.ID,
+				downloader.DownloadOptions{
+					OutputDir: m.router.GetConfig().DefaultDownloadDir,
+					ProgressCb: func(p downloader.Progress) {
+						select {
+						case m.progressChan <- p:
+						default: // don't block if TUI is slow
+						}
+					},
+				},
+			)
+			m.doneChan <- dlCompleteMsg{result: result, err: err}
+		}()
+
+		// Block until the first event arrives
+		select {
+		case p := <-m.progressChan:
+			return downloadProgressMsg{progress: p}
+		case d := <-m.doneChan:
+			return d
+		}
 	}
 }
 
@@ -223,14 +254,15 @@ func (m *DownloadView) View() string {
 	switch m.state {
 	case DLStateConfirm:
 		b.WriteString(fmt.Sprintf("Ready to download '%s' - %s?\n", m.model.Name, m.version.Name))
-		b.WriteString(fmt.Sprintf("Size: ~%.2f MB\n", float64(m.totalBytes)/(1024*1024)))
+		b.WriteString(fmt.Sprintf("Size: ~%s\n", downloader.FormatBytes(m.totalBytes)))
 		b.WriteString("\n")
 		b.WriteString(ui.Sub("[Enter] or [y] Start Download   [Esc] Cancel"))
 
-	case DLStateDownloading:
-		pct := 0.0
-		if m.totalBytes > 0 {
-			pct = float64(m.bytesDld) / float64(m.totalBytes)
+	case DLStateDownloading, DLStateCancelling:
+		p := m.progress
+		pct := p.Percentage / 100.0
+		if pct > 1 {
+			pct = 1
 		}
 
 		barWidth := 40
@@ -242,13 +274,43 @@ func (m *DownloadView) View() string {
 		bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
 
 		b.WriteString(fmt.Sprintf("Downloading %s...\n", m.version.Name))
-		b.WriteString(fmt.Sprintf("[%s] %.1f%%\n", ui.Info(bar), pct*100))
-		b.WriteString(fmt.Sprintf("%d / %d KB\n", m.bytesDld/1024, m.totalBytes/1024))
+		b.WriteString(fmt.Sprintf("[%s] %.1f%%\n", ui.Info(bar), p.Percentage))
+		b.WriteString(fmt.Sprintf("%s / %s\n",
+			downloader.FormatBytes(p.DownloadedBytes),
+			downloader.FormatBytes(p.TotalBytes)))
 		b.WriteString("\n")
-		b.WriteString(ui.Warning("Please wait..."))
+
+		// Speed + ETA
+		b.WriteString(fmt.Sprintf("Speed: %s  |  ETA: %s\n",
+			ui.Info(downloader.FormatSpeed(p.Speed)),
+			downloader.FormatETA(p.ETA)))
+
+		// Chunk indicator
+		if p.ActiveChunks > 0 {
+			b.WriteString(fmt.Sprintf("Chunks: %s active  |  Elapsed: %s\n",
+				ui.Info(fmt.Sprintf("%d", p.ActiveChunks)),
+				p.Elapsed.Truncate(time.Second).String()))
+		}
+		b.WriteString("\n")
+
+		if m.state == DLStateCancelling {
+			b.WriteString(ui.Warning("Cancelling download..."))
+		} else {
+			b.WriteString(ui.Warning("Please wait...  [Esc] Cancel"))
+		}
 
 	case DLStateSuccess:
-		b.WriteString(ui.Success(fmt.Sprintf("Download complete!\nSaved to: %s\n", m.outputFile)))
+		var summary string
+		if m.result != nil {
+			summary = fmt.Sprintf("Download complete!\nSaved to: %s\nAvg speed: %s  |  Time: %s  |  Chunks: %d\n",
+				m.outputFile,
+				downloader.FormatSpeed(m.result.AvgSpeed),
+				m.result.Duration.Truncate(time.Second).String(),
+				m.result.ChunksUsed)
+		} else {
+			summary = fmt.Sprintf("Download complete!\nSaved to: %s\n", m.outputFile)
+		}
+		b.WriteString(ui.Success(summary))
 		b.WriteString("\n")
 		b.WriteString(ui.Sub("[Esc] Back to Model"))
 
